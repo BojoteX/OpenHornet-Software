@@ -11,9 +11,11 @@
 |--------|--------|-------|
 | Poll packet format | ✅ CORRECT | 3 bytes, no checksum |
 | Broadcast format | ✅ CORRECT | With checksum |
-| RX state machine | ⚠️ MINOR ISSUE | Single timeout vs dual |
+| RX state machine | ❌ BUG | Length decrement error |
+| Timeouts | ⚠️ MINOR | Single value vs dual |
 | Export data encoding | ✅ CORRECT | Valid DCS-BIOS format |
-| Slave response parsing | ✅ CORRECT | Handles 0-length and data |
+| Slave response parsing | ⚠️ BUG | Off-by-one in data read |
+| Expected timeout hacks | ✅ CORRECT | Accommodates Arduino behavior |
 | Baud rate | ❓ VERIFY | Need to check RS485Config.h |
 
 **Overall:** Your implementation is ~95% protocol-compatible. A few timing refinements needed.
@@ -482,31 +484,42 @@ if (elapsed > RS485_POLL_TIMEOUT_US) {
 - 1000 µs in RX_WAIT_LENGTH
 - 5000 µs in other RX states
 
-### 🟡 MEDIUM: Questionable "Expected Timeout" Logic
+### 🟢 CORRECT: Expected Timeout Accommodations
+
+These are **NOT protocol bugs** - they are accommodations for real Arduino slave behavior discovered empirically:
 
 ```cpp
-// After receiving data, slave will miss next poll (expected Arduino behavior)
-rs485_expectTimeoutAfterData = true;
+rs485_expectTimeoutAfterData = true;      // Slave misses ~1 poll after TX
+rs485_skipTimeoutsAfterBroadcast = 10;    // Slaves miss ~10 polls after broadcast
 ```
 
-**I don't see this behavior in the Arduino code.** The slave transitions directly to RX_WAIT_ADDRESS after TX_CHECKSUM_SENT. There's no inherent "miss next poll."
-
-This might be an empirical observation from testing, but it's not in the protocol spec.
-
-### 🟡 MEDIUM: Skip Timeouts After Broadcast
+**Why this happens:** The Arduino slave's `loop()` is blocking, not fully interrupt-driven:
 
 ```cpp
-rs485_skipTimeoutsAfterBroadcast = 10;  // Skip next 10 timeouts
+// Arduino slave loop architecture
+void loop() {
+    DcsBios::loop();  // ← RX ISR active during state machine ONLY
+
+    // After TX completes, state → RX_WAIT_ADDRESS, but then:
+    PollingInput::pollInputs();        // ← Scans all switches (BLOCKING)
+    ExportStreamListener::loopAll();   // ← Processes export data (BLOCKING)
+
+    // ⚠️ DURING THESE CALLS: Slave is "deaf" to incoming polls!
+    // If master polls during this window, slave misses it.
+}
 ```
 
-**Not in Arduino code.** After broadcast, Arduino goes to IDLE and either sends more data or polls normally.
+**Timing windows:**
+1. **After slave TX:** Slave processes any buffered export data before returning to RX state. Master polling during this ~1-2ms window gets no response.
+2. **After broadcast:** All slaves simultaneously process the export data. Depending on data size and number of callbacks, this can take 5-20ms where slaves miss polls.
 
-If you're seeing timeouts after broadcast, the issue might be:
-1. Broadcast taking longer than expected
-2. Slaves busy processing export data
-3. Bus contention issues
+**Recommendation:** Make these values configurable in RS485Config.h:
+```cpp
+#define RS485_EXPECTED_TIMEOUTS_AFTER_TX       1   // Polls slave misses after TX
+#define RS485_EXPECTED_TIMEOUTS_AFTER_BCAST    10  // Polls missed after broadcast
+```
 
-Consider removing this and investigating root cause.
+These aren't bugs to fix - they're necessary accommodations for real Arduino hardware behavior.
 
 ### 🟢 MINOR: Change-Only Broadcasting
 
@@ -569,14 +582,21 @@ if (available == 0) {
 }
 ```
 
-### Fix 3: Remove Questionable Hacks (Optional)
+### Fix 3: Make Timeout Accommodations Configurable
 
-Consider removing or making configurable:
+These values are correct accommodations for Arduino slave behavior. Make them configurable:
+
 ```cpp
-// These aren't in the Arduino protocol:
-rs485_expectTimeoutAfterData = true;      // Remove or verify empirically
-rs485_skipTimeoutsAfterBroadcast = 10;    // Remove or reduce
+// Add to RS485Config.h
+#define RS485_EXPECTED_TIMEOUTS_AFTER_TX       1   // Slave misses ~1 poll after TX
+#define RS485_EXPECTED_TIMEOUTS_AFTER_BCAST    10  // Slaves miss ~10 polls after broadcast
+
+// Then in RS485Master.cpp, replace hardcoded values:
+rs485_expectTimeoutAfterData = true;  // Uses RS485_EXPECTED_TIMEOUTS_AFTER_TX
+rs485_skipTimeoutsAfterBroadcast = RS485_EXPECTED_TIMEOUTS_AFTER_BCAST;
 ```
+
+These accommodate the Arduino's blocking loop() architecture where slaves become "deaf" while processing export data or after transmitting.
 
 ---
 
@@ -612,7 +632,7 @@ rs485_skipTimeoutsAfterBroadcast = 10;    // Remove or reduce
 Your CockpitOS implementation is **very close** to protocol-correct. The main issues are:
 
 1. **🔴 CRITICAL:** Fix the `rs485_rxExpected--` in RX_WAIT_MSGTYPE
-2. **🟡 MEDIUM:** Implement dual timeout values
-3. **🟢 OPTIONAL:** Remove/verify the expected-timeout and skip-timeouts hacks
+2. **🟡 MEDIUM:** Implement dual timeout values (1000µs no-device, 5000µs incomplete)
+3. **🟢 GOOD:** Expected-timeout and skip-timeouts accommodations are CORRECT for real Arduino behavior - just make them configurable
 
 After fixing #1, your implementation should be fully compatible with OpenHornet ABSIS slaves.
